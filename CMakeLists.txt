@@ -11,3 +11,5 @@ link_directories(${X11_LIBRARY_DIRS})
 add_executable(xfsel main.c)
 
 target_link_libraries(xfsel ${X11_LIBRARIES})
+
+install(TARGETS xfsel DESTINATION bin)
