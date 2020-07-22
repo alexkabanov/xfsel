@@ -22,6 +22,8 @@ static Atom property_atom;
 static Atom null_atom;
 static Atom uri_list_atom;
 static Atom copied_files_atom;
+static Atom utf8_string_atom;
+static Atom text_atom;
 
 static char opts[] = "hcyp";
 static struct option long_options[] = {
@@ -32,10 +34,9 @@ static struct option long_options[] = {
   {0, 0, 0, 0}
 };
 static int command = 0;
-static int file_count;
-static char **files;
-static char *uri_list = NULL;
-static int uri_list_size = 0;
+static size_t file_count;
+static char **files = NULL;
+static char *dest = NULL;
 
 static void
 print_help(char *cmd)
@@ -48,22 +49,12 @@ print_help(char *cmd)
   printf("  -p, --paste   Paste files from clipboard to directory\n");
 }
 
-static void
-build_uri_list()
+static size_t
+build_uri_list(char *uri_list, char **files, size_t file_count)
 {
-  if (command == 'y')
-    {
-      uri_list = strdup("cut");
-      uri_list_size = 3;
-    }
-  else if (command == 'c')
-    {
-      uri_list = strdup("copy");
-      uri_list_size = 4;
-    }
-
+  size_t uri_list_size = 0;
   char rpath[PATH_MAX];
-  for (int i=0; i<file_count; i++)
+  for (size_t i=0; i<file_count; i++)
     {
       if (realpath(files[i], rpath) != rpath)
         {
@@ -71,10 +62,31 @@ build_uri_list()
           exit(1);
         }
       size_t len = strlen(rpath);
-      uri_list = realloc(uri_list, (size_t) uri_list_size + len + 9);
-      sprintf(uri_list + uri_list_size, "\nfile://%s", rpath);
+      if (uri_list)
+        sprintf(uri_list + uri_list_size, "file://%s\n", rpath);
       uri_list_size += len + 8;
     }
+
+  return uri_list_size-1;
+}
+
+static size_t
+build_text(char *uri_list, char delim, char **files, size_t file_count) {
+  size_t text_size = 0;
+  char rpath[PATH_MAX];
+  for (size_t i=0; i<file_count; i++)
+    {
+      if (realpath(files[i], rpath) != rpath)
+        {
+          fprintf(stderr, "Bad file name: '%s'", files[i]);
+          exit(1);
+        }
+      size_t len = strlen(rpath);
+      if (uri_list)
+        sprintf(uri_list + text_size, "%s%c", rpath, delim);
+      text_size += len + 1;
+    }
+  return text_size-1;
 }
 
 static Time
@@ -185,7 +197,7 @@ wait_selection_requests()
                 }
               else if (ev.target == targets_atom)
                 {
-                  Atom types[] = { targets_atom, uri_list_atom, copied_files_atom };
+                  Atom types[] = { targets_atom, uri_list_atom, copied_files_atom, utf8_string_atom, text_atom };
                   ev.property = xsr->property;
                   XChangeProperty(display, ev.requestor, ev.property, XA_ATOM,
                                   32, PropModeReplace, (unsigned char *) types,
@@ -193,18 +205,59 @@ wait_selection_requests()
                 }
               else if (ev.target == uri_list_atom)
                 {
-                  char *begin_list = strchr(uri_list, '\n') + 1;
-                  ev.property = xsr->property;
-                  XChangeProperty (display, ev.requestor, ev.property, ev.target,
-                                   8, PropModeReplace, (unsigned char *) begin_list,
-                                   uri_list_size - (int) (begin_list - uri_list));
-                }
-              else if (ev.target == copied_files_atom)
-                {
+                  char *uri_list;
+                  size_t uri_list_len = 0;
+
+                  uri_list_len = build_uri_list(NULL, files, file_count);
+                  uri_list = alloca(uri_list_len+1);
+                  build_uri_list(uri_list, files, file_count);
+                  uri_list[uri_list_len] = '\0';
+
                   ev.property = xsr->property;
                   XChangeProperty (display, ev.requestor, ev.property, ev.target,
                                    8, PropModeReplace, (unsigned char *) uri_list,
-                                   uri_list_size);
+                                   (int) uri_list_len);
+                }
+              else if (ev.target == copied_files_atom)
+                {
+                  char *uri_list;
+                  size_t uri_list_len = 0;
+                  if (command == 'y')
+                      uri_list = strdup("cut\n");
+                  else if (command == 'c')
+                      uri_list = strdup("copy\n");
+                  else
+                    {
+                      fprintf(stderr, "Error command\n");
+                      exit(1);
+                    }
+
+                  uri_list_len = strlen(uri_list) + build_uri_list(NULL, files, file_count);
+                  uri_list = realloc(uri_list, uri_list_len+1);
+                  build_uri_list(uri_list + strlen(uri_list), files, file_count);
+                  uri_list[uri_list_len] = '\0';
+
+                  ev.property = xsr->property;
+                  XChangeProperty (display, ev.requestor, ev.property, ev.target,
+                                   8, PropModeReplace, (unsigned char *) uri_list,
+                                   (int) uri_list_len);
+                  free(uri_list);
+                }
+              else if (ev.target == utf8_string_atom || ev.target == text_atom)
+                {
+                  char *string;
+                  size_t string_len = build_text(NULL, ' ', files, file_count);
+                  string = alloca(string_len+1);
+                  if (ev.target == utf8_string_atom)
+                    build_text(string, ' ', files, file_count);
+                  else
+                    build_text(string, '\n', files, file_count);
+                  string[string_len] = '\0';
+
+                  ev.property = xsr->property;
+                  XChangeProperty (display, ev.requestor, ev.property, ev.target,
+                                   8, PropModeReplace, (unsigned char *) string,
+                                   (int) string_len);
                 }
               else
                 ev.property = None;
@@ -221,17 +274,88 @@ wait_selection_requests()
     }
 }
 
-static Bool
+static size_t
+files_from_uri_list(char **arr,
+                    char *list)
+{
+  size_t res = 0;
+  while ((list = strchr(list, '\n')))
+    {
+      if (arr)
+        {
+          *list = '\0';
+          list ++;
+          *arr = list;
+          arr ++;
+        }
+      else
+        list ++;
+      res ++;
+    }
+  return res;
+}
+
+static int
 do_paste()
 {
-  int num = 0;
-  char *ptr;
-  while((ptr = strchr(uri_list, '\n')))
+  char *uri_list = get_selection(clipboard_atom, copied_files_atom);
+  if (!uri_list)
+    return 1;
+  const char *prefix = "file://";
+  const int prefix_len = 7;
+  file_count = 0;
+  file_count = files_from_uri_list(NULL, uri_list);
+  if (file_count <= 0)
+    return True;
+  files = alloca((size_t) (sizeof (char*) * file_count));
+  files_from_uri_list(files, uri_list);
+  if (file_count <= 0)
     {
-      ptr++;
-      num++;
+      fprintf(stderr, "no files\n");
+      if (uri_list)
+        free(uri_list);
+      return 1;
     }
-  return False;
+
+  for (size_t i=0; i<file_count; i++)
+    {
+      if (files[i][0] == '\n' ||
+          files[i][0] == '\0' ||
+          strncmp(files[i], prefix, prefix_len) != 0)
+        {
+          fprintf(stderr, "not supported item: %s\n", files[i]);
+          if (uri_list)
+            free(uri_list);
+          return 1;
+        }
+      files[i] += prefix_len;
+    }
+
+  char **args = alloca(file_count+4);
+  int argn = 0;
+
+  if (strncmp("cut", uri_list, 3) == 0)
+    args[argn++] = "/bin/mv";
+  else if (strncmp("copy", uri_list, 4) == 0)
+    {
+      args[argn++] = "/bin/cp";
+      args[argn++] = "-r";
+    }
+  else
+    {
+      fprintf(stderr, "not supported operation\n");
+      if (uri_list)
+        free(uri_list);
+      return 1;
+    }
+
+  for (size_t i=0; i<file_count; i++)
+    args[argn++] = files[i];
+  args[argn++] = dest;
+  args[argn++] = NULL;
+  if (uri_list)
+    free(uri_list);
+  return execv(args[0], args);
 }
 
 static void
@@ -239,8 +363,13 @@ before_exit()
 {
   if (display)
     XCloseDisplay(display);
-  if (uri_list)
-    free(uri_list);
+  if (files)
+    {
+      for (size_t i = 0; i<file_count; i++)
+        free(files[i]);
+      free(files);
+      files = NULL;
+    }
 }
 
 int main(int argc, char **argv)
@@ -267,7 +396,7 @@ int main(int argc, char **argv)
           case 'p':
             if (command)
               {
-                fprintf(stderr, "Only one oprftion!\n");
+                fprintf(stderr, "Only one option!\n");
                 return 1;
               }
             command = c;
@@ -280,14 +409,37 @@ int main(int argc, char **argv)
 
   if (command == 'c' || command == 'y')
     {
-      file_count = argc - optind;
-      files = argv + optind;
+      file_count = (size_t) (argc - optind);
       if (file_count <= 0)
         {
           fprintf(stderr, "Missing operand specifying file!\n");
           exit(1);
         }
-      build_uri_list();
+      char **argfiles = argv + optind;
+      char rpath[PATH_MAX];
+      files = malloc(sizeof (char*) * file_count);
+      for (size_t i=0; i<file_count; i++)
+        {
+          if (realpath(argfiles[i], rpath) != rpath)
+            {
+              fprintf(stderr, "Bad file name: '%s'", argfiles[i]);
+              exit(1);
+            }
+          files[i] = strdup(rpath);
+        }
+    }
+  else if (command == 'p')
+    {
+      if (argc - optind > 1)
+        {
+          fprintf(stderr, "Too many arguments!\n");
+          exit(1);
+        }
+      else if (argc - optind == 1)
+        dest = argv[optind];
+      else
+        dest = "./";
+
     }
   else if (command != 'p')
     {
@@ -313,15 +465,12 @@ int main(int argc, char **argv)
   null_atom = XInternAtom (display, "NULL", False);
   uri_list_atom = XInternAtom (display, "text/uri-list", False);
   copied_files_atom = XInternAtom (display, "x-special/gnome-copied-files", False);
+  utf8_string_atom = XInternAtom (display, "UTF8_STRING", False);
+  text_atom = XInternAtom (display, "TEXT", False);
 
   if (command == 'p')
     {
-      uri_list = get_selection(clipboard_atom, copied_files_atom);
-      if (uri_list)
-        {
-          puts(uri_list);
-        }
-      fprintf(stderr, "not yet implemented\n");
+      return do_paste();
     }
   else if (command == 'y' || command == 'c')
     {
@@ -343,11 +492,16 @@ int main(int argc, char **argv)
       wait_selection_requests();
     }
 
+
   XCloseDisplay(display);
   display = NULL;
-  if (uri_list)
-    free(uri_list);
-  uri_list = NULL;
+  if (files)
+    {
+      for (size_t i = 0; i<file_count; i++)
+        free(files[i]);
+      free(files);
+      files = NULL;
+    }
 
   return 0;
 }

@@ -12,7 +12,7 @@ Cut to clipboard:
 
 Paste from clipboard:
 
-    `xfsel -y [directory]`
+    `xfsel -p [directory]`
 
 ## Installation
 
